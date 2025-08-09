@@ -1,0 +1,55 @@
+system:
+  cpu:
+    model: "Intel Core i9-13900K"
+    cores: 24
+    threads: 32
+    frequency: "3.0 GHz"
+    cache: "36 MB"
+  
+  memory:
+    total: "64 GB"
+    type: "DDR5"
+    speed: "5600 MHz"
+  
+  gpu:
+    model: "NVIDIA RTX 4090"
+    memory: "24 GB GDDR6X"
+    cuda_cores: 16384
+    tensor_cores: 512
+  
+  storage:
+    type: "NVMe SSD"
+    capacity: "2 TB"
+    read_speed: "7000 MB/s"
+    write_speed: "5300 MB/s"
+
+resource_limits:
+  cpu_intensive:
+    max_cpus: 8
+    max_memory: "16 GB"
+    max_time: "2 hours"
+  
+  gpu_training:
+    max_cpus: 4
+    max_memory: "32 GB"
+    max_gpu_memory: "20 GB"
+    max_time: "6 hours"
+  
+  memory_intensive:
+    max_cpus: 2
+    max_memory: "64 GB"
+    max_time: "4 hours"
+  
+  llm_inference:
+    max_cpus: 6
+    max_memory: "48 GB"
+    max_gpu_memory: "22 GB"
+    max_time: "1 hour"
+
+monitoring:
+  sampling_interval: 0.1  # seconds
+  enable_cpu_monitoring: true
+  enable_memory_monitoring: true
+  enable_gpu_monitoring: true
+  enable_energy_monitoring: false  # Requires specific hardware
+  enable_network_monitoring: false 

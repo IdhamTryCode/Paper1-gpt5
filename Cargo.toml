@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "src/rust/classical_ml/regression_benchmark",
+    "src/rust/classical_ml/svm_benchmark",
+    "src/rust/classical_ml/clustering_benchmark",
+    "src/rust/deep_learning/cnn_benchmark",
+    "src/rust/deep_learning/rnn_benchmark",
+    "src/rust/reinforcement_learning/dqn_benchmark",
+    "src/rust/reinforcement_learning/policy_gradient_benchmark"
+]
+
+[package]
+name = "paper1-root"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/rust/lib.rs"
