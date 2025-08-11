@@ -33,10 +33,11 @@ sns.set_palette("husl")
 class BenchmarkVisualizer:
     """Creates visualizations for benchmark results."""
     
-    def __init__(self, statistical_results_path: str):
+    def __init__(self, statistical_results_path: str, task_filter: str | None = None):
         self.statistical_results_path = statistical_results_path
         self.statistical_results = self._load_statistical_results()
         self.output_plots_dir = "plots"
+        self.task_filter = task_filter
         
         # Create output directory
         os.makedirs(self.output_plots_dir, exist_ok=True)
@@ -69,6 +70,8 @@ class BenchmarkVisualizer:
             task_names = []
             
             for task_type, analysis in self.statistical_results.get('task_analyses', {}).items():
+                if hasattr(self, 'task_filter') and self.task_filter and task_type != self.task_filter:
+                    continue
                 if metric in analysis.get('performance_metrics', {}):
                     comparison = analysis['performance_metrics'][metric]
                     if 'rust_stats' in comparison and 'python_stats' in comparison:
@@ -102,7 +105,8 @@ class BenchmarkVisualizer:
                            f'{height:.2f}', ha='center', va='bottom')
         
         plt.tight_layout()
-        plot_path = os.path.join(self.output_plots_dir, 'performance_comparison.png')
+        suffix = f"_{self.task_filter}" if getattr(self, 'task_filter', None) else ""
+        plot_path = os.path.join(self.output_plots_dir, f'performance_comparison{suffix}.png')
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -125,6 +129,8 @@ class BenchmarkVisualizer:
             task_names = []
             
             for task_type, analysis in self.statistical_results.get('task_analyses', {}).items():
+                if hasattr(self, 'task_filter') and self.task_filter and task_type != self.task_filter:
+                    continue
                 if metric in analysis.get('resource_metrics', {}):
                     comparison = analysis['resource_metrics'][metric]
                     if 'rust_stats' in comparison and 'python_stats' in comparison:
@@ -171,7 +177,8 @@ class BenchmarkVisualizer:
         ax.axis('off')
         
         plt.tight_layout()
-        plot_path = os.path.join(self.output_plots_dir, 'resource_usage_comparison.png')
+        suffix = f"_{self.task_filter}" if getattr(self, 'task_filter', None) else ""
+        plot_path = os.path.join(self.output_plots_dir, f'resource_usage_comparison{suffix}.png')
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -194,6 +201,8 @@ class BenchmarkVisualizer:
             task_names = []
             
             for task_type, analysis in self.statistical_results.get('task_analyses', {}).items():
+                if hasattr(self, 'task_filter') and self.task_filter and task_type != self.task_filter:
+                    continue
                 if metric in analysis.get('quality_metrics', {}):
                     comparison = analysis['quality_metrics'][metric]
                     if 'rust_stats' in comparison and 'python_stats' in comparison:
@@ -217,7 +226,8 @@ class BenchmarkVisualizer:
                 ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plot_path = os.path.join(self.output_plots_dir, 'quality_metrics_comparison.png')
+        suffix = f"_{self.task_filter}" if getattr(self, 'task_filter', None) else ""
+        plot_path = os.path.join(self.output_plots_dir, f'quality_metrics_comparison{suffix}.png')
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -297,7 +307,8 @@ class BenchmarkVisualizer:
             plt.title('Effect Size Heatmap: Rust vs Python Comparisons')
             plt.tight_layout()
             
-            heatmap_path = os.path.join(self.output_plots_dir, 'effect_size_heatmap.png')
+            suffix = f"_{self.task_filter}" if getattr(self, 'task_filter', None) else ""
+            heatmap_path = os.path.join(self.output_plots_dir, f'effect_size_heatmap{suffix}.png')
             plt.savefig(heatmap_path, dpi=300, bbox_inches='tight')
             plt.close()
             
@@ -364,26 +375,33 @@ def main():
                        help="Output file for visualization metadata")
     parser.add_argument("--output-plots", default="plots", 
                        help="Output directory for plot files")
+    parser.add_argument("--split-by-task", action="store_true", help="Produce separate plots per task type (classical_ml and deep_learning)")
     
     args = parser.parse_args()
     
-    # Create visualizer
-    visualizer = BenchmarkVisualizer(args.statistical_results)
-    visualizer.output_plots_dir = args.output_plots
-    
-    # Create all visualizations
-    visualization_paths = visualizer.create_all_visualizations()
+    all_paths: Dict[str, str] = {}
+    if args.split_by_task:
+        for task in ["classical_ml", "deep_learning"]:
+            v = BenchmarkVisualizer(args.statistical_results, task_filter=task)
+            v.output_plots_dir = args.output_plots
+            paths = v.create_all_visualizations()
+            for k, pth in paths.items():
+                all_paths[f"{k}_{task}"] = pth
+    else:
+        v = BenchmarkVisualizer(args.statistical_results)
+        v.output_plots_dir = args.output_plots
+        all_paths = v.create_all_visualizations()
     
     # Save visualization metadata
     with open(args.output_visualizations, 'w') as f:
-        json.dump(visualization_paths, f, indent=2)
+        json.dump(all_paths, f, indent=2)
     
     logger.info(f"Visualization metadata saved to: {args.output_visualizations}")
     logger.info(f"Plot files saved to: {args.output_plots}")
     
     # Print summary
     logger.info("Visualization Summary:")
-    for viz_type, path in visualization_paths.items():
+    for viz_type, path in all_paths.items():
         logger.info(f"  {viz_type}: {path}")
 
 

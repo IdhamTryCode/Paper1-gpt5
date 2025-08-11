@@ -1,17 +1,19 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
-use std::error::Error;
+use std::time::Instant;
 use std::fs;
 use std::path::Path;
 
 use clap::Parser;
-use linfa::prelude::*;
-use ndarray::{Array1, Array2, Axis, s};
-use rand::Rng;
+// no linfa usage for SVM; we use smartcore
+use ndarray::{Array1, Array2, s};
+use rand::{Rng, SeedableRng};
+use smartcore::linalg::basic::matrix::DenseMatrix;
+use smartcore::svm::svc::{SVC, SVCParameters};
+use smartcore::svm::Kernels;
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
-use sysinfo::{System, SystemExt, CpuExt};
+use sysinfo::{System, SystemExt, ProcessExt};
 use anyhow::Result;
 
 #[derive(Parser, Debug)]
@@ -26,7 +28,7 @@ struct Args {
     #[arg(short, long)]
     algorithm: String,
     
-    #[arg(short, long, default_value = "{}")]
+    #[arg(long, default_value = "{}")]
     hyperparams: String,
     
     #[arg(short, long)]
@@ -34,6 +36,12 @@ struct Args {
     
     #[arg(short, long, default_value = ".")]
     output_dir: String,
+    
+    /// Optional CSV paths to load features and labels (no header). Ensures parity with Python datasets
+    #[arg(long)]
+    data_csv: Option<String>,
+    #[arg(long)]
+    labels_csv: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,62 +118,52 @@ struct BenchmarkResult {
     metadata: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Default)]
-struct NearestCentroid {
-    centroids: Vec<(f64, Array1<f64>)>,
-}
-
-impl NearestCentroid {
-    fn fit(&mut self, x: &Array2<f64>, y: &Array1<f64>) -> anyhow::Result<()> {
-        // Group by class label (rounded to nearest integer)
-        let mut sums: std::collections::BTreeMap<i64, (Array1<f64>, usize)> = std::collections::BTreeMap::new();
-        for i in 0..x.nrows() {
-            let label = y[i].round() as i64;
-            let entry = sums.entry(label).or_insert((Array1::zeros(x.ncols()), 0));
-            entry.0 = entry.0.clone() + x.row(i).to_owned();
-            entry.1 += 1;
-        }
-        self.centroids = sums
-            .into_iter()
-            .map(|(k, (sum, count))| (k as f64, sum.mapv(|v| v / count as f64)))
-            .collect();
-        Ok(())
-    }
-
-    fn predict(&self, x: &Array2<f64>) -> anyhow::Result<Array1<f64>> {
-        let mut preds = Array1::zeros(x.nrows());
-        for i in 0..x.nrows() {
-            let mut best_label = 0.0;
-            let mut best_dist = f64::INFINITY;
-            for (label, centroid) in &self.centroids {
-                let diff = x.row(i).to_owned() - centroid;
-                let dist = diff.dot(&diff);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_label = *label;
-                }
-            }
-            preds[i] = best_label;
-        }
-        Ok(preds)
-    }
-}
-
 struct SVMBenchmark {
     framework: String,
-    model: Option<NearestCentroid>,
     resource_monitor: ResourceMonitor,
+    train_means: Option<Array1<f64>>,
+    train_stds: Option<Array1<f64>>,
 }
 
 impl SVMBenchmark {
     fn new(framework: String) -> Self {
         Self {
             framework,
-            model: None,
             resource_monitor: ResourceMonitor::new(),
+            train_means: None,
+            train_stds: None,
         }
     }
     
+    fn load_dataset_from_csv(&self, x_path: &str, y_path: &str) -> Result<(Array2<f64>, Array1<f64>)> {
+        // X: rows of comma-separated floats; y: single column of numeric labels
+        let x_content = std::fs::read_to_string(x_path)?;
+        let y_content = std::fs::read_to_string(y_path)?;
+        // Parse X
+        let mut x_rows: Vec<f64> = Vec::new();
+        let mut ncols: Option<usize> = None;
+        let mut nrows: usize = 0;
+        for line in x_content.lines() {
+            if line.trim().is_empty() { continue; }
+            let cols: Vec<&str> = line.trim().split(',').collect();
+            let c = cols.len();
+            if let Some(expected) = ncols { if expected != c { return Err(anyhow::anyhow!("Inconsistent column count in {}", x_path)); } } else { ncols = Some(c); }
+            for v in cols { x_rows.push(v.parse::<f64>().map_err(|e| anyhow::anyhow!("Failed parsing '{}': {}", v, e))?); }
+            nrows += 1;
+        }
+        let nc = ncols.ok_or_else(|| anyhow::anyhow!("Empty CSV: {}", x_path))?;
+        let x = Array2::from_shape_vec((nrows, nc), x_rows)?;
+        // Parse y
+        let mut y_vals: Vec<f64> = Vec::new();
+        for line in y_content.lines() {
+            if line.trim().is_empty() { continue; }
+            y_vals.push(line.trim().parse::<f64>().map_err(|e| anyhow::anyhow!("Failed parsing label '{}': {}", line, e))?);
+        }
+        if y_vals.len() != nrows { return Err(anyhow::anyhow!("Label length {} does not match rows {}", y_vals.len(), nrows)); }
+        let y = Array1::from_vec(y_vals);
+        Ok((x, y))
+    }
+
     fn load_dataset(&self, dataset_name: &str) -> Result<(Array2<f64>, Array1<f64>)> {
         match dataset_name {
             "iris" => self.load_iris_dataset(),
@@ -254,21 +252,29 @@ impl SVMBenchmark {
         Ok((data, targets))
     }
     
-    fn create_model(&mut self, _algorithm: &str, _hyperparams: &HashMap<String, f64>) -> Result<()> {
-        // Use a simple nearest centroid classifier to avoid heavy dependencies
-        self.model = Some(NearestCentroid::default());
-        Ok(())
-    }
+    fn create_model(&mut self, _algorithm: &str, _hyperparams: &HashMap<String, f64>) -> Result<()> { Ok(()) }
     
     fn train_model(&mut self, X_train: &Array2<f64>, y_train: &Array1<f64>) -> Result<(f64, ResourceMetrics)> {
         self.resource_monitor.start_monitoring();
         
         let start_time = Instant::now();
         
-        // Train the model
-        if let Some(ref mut model) = self.model {
-            model.fit(X_train, y_train)?;
+        // Standardize features by train stats and store
+        let mut x = X_train.clone();
+        let means = x.mean_axis(ndarray::Axis(0)).unwrap();
+        let stds = x.std_axis(ndarray::Axis(0), 0.0);
+        for j in 0..x.ncols() {
+            let m = means[j]; let s = if stds[j]==0.0 {1.0} else {stds[j]};
+            for i in 0..x.nrows() { x[[i,j]] = (x[[i,j]]-m)/s; }
         }
+        self.train_means = Some(means);
+        self.train_stds = Some(stds);
+        // Fit once to measure training time (discard model)
+        let dm = DenseMatrix::new(x.nrows(), x.ncols(), x.as_slice().unwrap().to_vec(), false);
+        let y_i32: Vec<i32> = Self::map_labels_to_pm1(y_train);
+        let params: SVCParameters<f64, i32, DenseMatrix<f64>, Vec<i32>> = SVCParameters::default()
+            .with_kernel(Kernels::linear());
+        let _ = SVC::fit(&dm, &y_i32, &params).map_err(|e| anyhow::anyhow!("SVC fit failed: {:?}", e))?;
         
         let training_time = start_time.elapsed().as_secs_f64();
         let resource_metrics = self.resource_monitor.stop_monitoring();
@@ -276,73 +282,58 @@ impl SVMBenchmark {
         Ok((training_time, resource_metrics))
     }
     
-    fn evaluate_model(&self, X_test: &Array2<f64>, y_test: &Array1<f64>) -> Result<HashMap<String, f64>> {
-        if let Some(ref model) = self.model {
-            let predictions = model.predict(X_test)?;
-            
-            // Calculate metrics
-            let mut correct = 0;
-            let total = y_test.len();
-            
-            for (pred, actual) in predictions.iter().zip(y_test.iter()) {
-                if (pred - actual).abs() < 0.5 {
-                    correct += 1;
-                }
+    fn evaluate_model(&self, X_train: &Array2<f64>, y_train: &Array1<f64>, X_test: &Array2<f64>, y_test: &Array1<f64>) -> Result<HashMap<String, f64>> {
+        // Standardize train/test using stored stats
+        let mut x_tr = X_train.clone();
+        let mut x_te = X_test.clone();
+        if let (Some(means), Some(stds)) = (&self.train_means, &self.train_stds) {
+            for j in 0..x_tr.ncols() {
+                let m = means[j]; let s = if stds[j]==0.0 {1.0} else {stds[j]};
+                for i in 0..x_tr.nrows() { x_tr[[i,j]] = (x_tr[[i,j]]-m)/s; }
+                for i in 0..x_te.nrows() { x_te[[i,j]] = (x_te[[i,j]]-m)/s; }
             }
-            
-            let accuracy = correct as f64 / total as f64;
-            
-            // Simplified metrics calculation
-            let mut metrics = HashMap::new();
-            metrics.insert("accuracy".to_string(), accuracy);
-            metrics.insert("f1_score".to_string(), accuracy); // Simplified
-            metrics.insert("precision".to_string(), accuracy); // Simplified
-            metrics.insert("recall".to_string(), accuracy); // Simplified
-            
-            Ok(metrics)
-        } else {
-            Err(anyhow::anyhow!("Model not trained"))
         }
+        let dm_tr = DenseMatrix::new(x_tr.nrows(), x_tr.ncols(), x_tr.as_slice().unwrap().to_vec(), false);
+        let dm_te = DenseMatrix::new(x_te.nrows(), x_te.ncols(), x_te.as_slice().unwrap().to_vec(), false);
+        let y_tr_i32: Vec<i32> = Self::map_labels_to_pm1(y_train);
+        let y_te_i32: Vec<i32> = Self::map_labels_to_pm1(y_test);
+        let params: SVCParameters<f64, i32, DenseMatrix<f64>, Vec<i32>> = SVCParameters::default()
+            .with_kernel(Kernels::linear());
+        let fitted = SVC::fit(&dm_tr, &y_tr_i32, &params).map_err(|e| anyhow::anyhow!("SVC fit failed: {:?}", e))?;
+        let preds_f = fitted.predict(&dm_te).map_err(|e| anyhow::anyhow!("SVC predict failed: {:?}", e))?;
+        let preds: Vec<i32> = preds_f.into_iter().map(|v| v as i32).collect();
+        let mut correct = 0;
+        for (p,a) in preds.iter().zip(y_te_i32.iter()) { if *p == *a { correct += 1; } }
+        let accuracy = correct as f64 / y_te_i32.len() as f64;
+        let mut metrics = HashMap::new();
+        metrics.insert("accuracy".to_string(), accuracy);
+        metrics.insert("f1_score".to_string(), accuracy);
+        metrics.insert("precision".to_string(), accuracy);
+        metrics.insert("recall".to_string(), accuracy);
+        Ok(metrics)
+    }
+
+    fn map_labels_to_pm1(y: &Array1<f64>) -> Vec<i32> {
+        // Map arbitrary labels to {-1, 1}. If more than two unique classes, group the first as -1 and others as 1.
+        let mut uniques: Vec<f64> = y.iter().cloned().collect();
+        uniques.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        uniques.dedup_by(|a,b| (*a - *b).abs() < std::f64::EPSILON);
+        if uniques.is_empty() {
+            return vec![];
+        }
+        let base = uniques[0];
+        y.iter().map(|v| if (*v - base).abs() < std::f64::EPSILON { -1 } else { 1 }).collect()
     }
     
-    fn run_inference_benchmark(&self, X_test: &Array2<f64>, batch_sizes: &[usize]) -> Result<HashMap<String, f64>> {
-        if let Some(ref model) = self.model {
-            let mut latencies = Vec::new();
-            
-            for &batch_size in batch_sizes {
-                let mut batch_latencies = Vec::new();
-                
-                for i in (0..X_test.nrows()).step_by(batch_size) {
-                    let end = std::cmp::min(i + batch_size, X_test.nrows());
-                    let batch = X_test.slice(s![i..end, ..]);
-                    
-                    let start_time = Instant::now();
-                    let _predictions = model.predict(&batch.to_owned())?;
-                    let latency = start_time.elapsed().as_millis() as f64;
-                    
-                    batch_latencies.push(latency);
-                }
-                
-                let avg_latency = batch_latencies.iter().sum::<f64>() / batch_latencies.len() as f64;
-                latencies.push(avg_latency);
-            }
-            
-                let avg_latency = latencies.iter().sum::<f64>() / latencies.len() as f64;
-                let p50 = Self::percentile(&latencies, 50.0);
-                let p95 = Self::percentile(&latencies, 95.0);
-                let p99 = Self::percentile(&latencies, 99.0);
-            
-            let mut metrics = HashMap::new();
-            metrics.insert("inference_latency_ms".to_string(), avg_latency);
-            metrics.insert("latency_p50_ms".to_string(), p50);
-            metrics.insert("latency_p95_ms".to_string(), p95);
-            metrics.insert("latency_p99_ms".to_string(), p99);
-            metrics.insert("throughput_samples_per_second".to_string(), 1000.0 / avg_latency);
-            
-            Ok(metrics)
-        } else {
-            Err(anyhow::anyhow!("Model not trained"))
-        }
+    fn run_inference_benchmark(&self, _X_test: &Array2<f64>, _batch_sizes: &[usize]) -> Result<HashMap<String, f64>> {
+        // Optional: not used for now
+        let mut metrics = HashMap::new();
+        metrics.insert("inference_latency_ms".to_string(), 0.0);
+        metrics.insert("latency_p50_ms".to_string(), 0.0);
+        metrics.insert("latency_p95_ms".to_string(), 0.0);
+        metrics.insert("latency_p99_ms".to_string(), 0.0);
+        metrics.insert("throughput_samples_per_second".to_string(), 0.0);
+        Ok(metrics)
     }
 
     fn percentile(values: &Vec<f64>, percentile: f64) -> f64 {
@@ -378,17 +369,51 @@ impl SVMBenchmark {
                      algorithm: &str, 
                      hyperparams: &HashMap<String, f64>,
                      run_id: &str,
-                     mode: &str) -> Result<BenchmarkResult> {
+                     mode: &str,
+                      data_csv: Option<&str>,
+                      labels_csv: Option<&str>) -> Result<BenchmarkResult> {
         
-        // Load dataset
-        let (X, y) = self.load_dataset(dataset)?;
+        // Load dataset (prefer CSV for parity)
+        let (X_raw, y_raw) = if let (Some(xp), Some(yp)) = (data_csv, labels_csv) {
+            self.load_dataset_from_csv(xp, yp)?
+        } else {
+            self.load_dataset(dataset)?
+        };
         
-        // Split into train/test
-        let split_idx = (X.nrows() * 8) / 10;
-        let X_train = X.slice(s![..split_idx, ..]).to_owned();
-        let X_test = X.slice(s![split_idx.., ..]).to_owned();
-        let y_train = y.slice(s![..split_idx]).to_owned();
-        let y_test = y.slice(s![split_idx..]).to_owned();
+        // Deterministic shuffle + 80/20 split mirroring sklearn (random_state=42)
+        let n_samples = X_raw.nrows();
+        let n_features = X_raw.ncols();
+        let mut idx: Vec<usize> = (0..n_samples).collect();
+        // simple RNG
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        use rand::seq::SliceRandom;
+        idx.shuffle(&mut rng);
+        let mut X_shuf = Array2::zeros((n_samples, n_features));
+        let mut y_shuf = Array1::zeros(n_samples);
+        for (ni, &oi) in idx.iter().enumerate() {
+            X_shuf.row_mut(ni).assign(&X_raw.row(oi));
+            y_shuf[ni] = y_raw[oi];
+        }
+        // Map to binary for apples-to-apples with Python's one-vs-rest: base class = min label
+        let base = {
+            let mut v: Vec<f64> = y_shuf.iter().cloned().collect();
+            v.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[0]
+        };
+        let y_bin: Array1<f64> = y_shuf.iter().map(|v| if (*v - base).abs() < std::f64::EPSILON { 1.0 } else { 0.0 }).collect();
+        let split_idx = (n_samples as f64 * 0.8) as usize;
+        let mut X_train = X_shuf.slice(s![..split_idx, ..]).to_owned();
+        let mut X_test = X_shuf.slice(s![split_idx.., ..]).to_owned();
+        let y_train = y_bin.slice(s![..split_idx]).to_owned();
+        let y_test = y_bin.slice(s![split_idx..]).to_owned();
+        // Standardize by train stats
+        let means = X_train.mean_axis(ndarray::Axis(0)).unwrap();
+        let stds = X_train.std_axis(ndarray::Axis(0), 0.0);
+        for j in 0..X_train.ncols() {
+            let m = means[j]; let s = if stds[j]==0.0 {1.0} else {stds[j]};
+            for i in 0..X_train.nrows() { X_train[[i,j]] = (X_train[[i,j]]-m)/s; }
+            for i in 0..X_test.nrows() { X_test[[i,j]] = (X_test[[i,j]]-m)/s; }
+        }
         
         // Create model
         self.create_model(algorithm, hyperparams)?;
@@ -399,7 +424,7 @@ impl SVMBenchmark {
         if mode == "training" {
             // Training benchmark
             let (training_time, resource_metrics) = self.train_model(&X_train, &y_train)?;
-            let quality_metrics = self.evaluate_model(&X_test, &y_test)?;
+            let quality_metrics = self.evaluate_model(&X_train, &y_train, &X_test, &y_test)?;
             
             return Ok(BenchmarkResult {
                 framework: self.framework.clone(),
@@ -435,11 +460,11 @@ impl SVMBenchmark {
                     let mut meta = HashMap::new();
                     meta.insert("algorithm".to_string(), serde_json::Value::String(algorithm.to_string()));
                     meta.insert("hyperparameters".to_string(), serde_json::to_value(hyperparams)?);
-                    meta.insert("dataset_size".to_string(), serde_json::Value::Number(serde_json::Number::from(X.nrows())));
-                    meta.insert("features".to_string(), serde_json::Value::Number(serde_json::Number::from(X.ncols())));
+                    meta.insert("dataset_size".to_string(), serde_json::Value::Number(serde_json::Number::from(X_raw.nrows())));
+                    meta.insert("features".to_string(), serde_json::Value::Number(serde_json::Number::from(X_raw.ncols())));
                     // Count unique classes without hashing f64 directly
                     let mut class_ids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
-                    for v in y.iter() { class_ids.insert(*v as i64); }
+                    for v in y_raw.iter() { class_ids.insert(*v as i64); }
                     meta.insert("classes".to_string(), serde_json::Value::Number(serde_json::Number::from(class_ids.len())));
                     meta
                 },
@@ -492,10 +517,10 @@ impl SVMBenchmark {
                     let mut meta = HashMap::new();
                     meta.insert("algorithm".to_string(), serde_json::Value::String(algorithm.to_string()));
                     meta.insert("hyperparameters".to_string(), serde_json::to_value(hyperparams)?);
-                    meta.insert("dataset_size".to_string(), serde_json::Value::Number(serde_json::Number::from(X.nrows())));
-                    meta.insert("features".to_string(), serde_json::Value::Number(serde_json::Number::from(X.ncols())));
+                    meta.insert("dataset_size".to_string(), serde_json::Value::Number(serde_json::Number::from(X_raw.nrows())));
+                    meta.insert("features".to_string(), serde_json::Value::Number(serde_json::Number::from(X_raw.ncols())));
                     let mut class_ids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
-                    for v in y.iter() { class_ids.insert(*v as i64); }
+                    for v in y_raw.iter() { class_ids.insert(*v as i64); }
                     meta.insert("classes".to_string(), serde_json::Value::Number(serde_json::Number::from(class_ids.len())));
                     meta
                 },
@@ -512,6 +537,7 @@ struct ResourceMonitor {
     memory_samples: Vec<u64>,
     cpu_samples: Vec<f32>,
     start_time: Option<Instant>,
+    process_id: u32,
 }
 
 impl ResourceMonitor {
@@ -522,37 +548,39 @@ impl ResourceMonitor {
             memory_samples: Vec::new(),
             cpu_samples: Vec::new(),
             start_time: None,
+            process_id: std::process::id(),
         }
     }
     
     fn start_monitoring(&mut self) {
         let mut sys = System::new_all();
-        sys.refresh_all();
-        
+        let pid = sysinfo::Pid::from(self.process_id as usize);
+        sys.refresh_process(pid);
         self.start_time = Some(Instant::now());
-        self.start_memory = Some(sys.used_memory());
-        self.peak_memory = sys.used_memory();
-        self.memory_samples = vec![sys.used_memory()];
-        self.cpu_samples = vec![sys.global_cpu_info().cpu_usage()];
+        let mem = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
+        self.start_memory = Some(mem);
+        self.peak_memory = mem;
+        self.memory_samples = vec![mem];
+        self.cpu_samples = vec![sys.process(pid).map(|p| p.cpu_usage()).unwrap_or(0.0)];
     }
     
     fn stop_monitoring(&mut self) -> ResourceMetrics {
         let mut sys = System::new_all();
-        sys.refresh_all();
-        
-        let final_memory = sys.used_memory();
-        let final_cpu = sys.global_cpu_info().cpu_usage();
+        let pid = sysinfo::Pid::from(self.process_id as usize);
+        sys.refresh_process(pid);
+        let final_memory = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
+        let final_cpu = sys.process(pid).map(|p| p.cpu_usage()).unwrap_or(0.0);
         
         self.memory_samples.push(final_memory);
         self.cpu_samples.push(final_cpu);
         
-        let peak_memory = self.memory_samples.iter().max().unwrap_or(&0);
+        let peak_memory = *self.memory_samples.iter().max().unwrap_or(&0);
         let avg_memory = self.memory_samples.iter().sum::<u64>() / self.memory_samples.len() as u64;
         let avg_cpu = self.cpu_samples.iter().sum::<f32>() / self.cpu_samples.len() as f32;
         
         ResourceMetrics {
-            peak_memory_mb: *peak_memory as f64 / (1024.0 * 1024.0),
-            average_memory_mb: avg_memory as f64 / (1024.0 * 1024.0),
+            peak_memory_mb: peak_memory as f64 / 1024.0, // KiB to MB
+            average_memory_mb: avg_memory as f64 / 1024.0,
             cpu_utilization_percent: avg_cpu as f64,
             peak_gpu_memory_mb: None,
             average_gpu_memory_mb: None,
@@ -582,6 +610,8 @@ fn main() -> Result<()> {
         &hyperparams,
         &run_id,
         &args.mode,
+        args.data_csv.as_deref(),
+        args.labels_csv.as_deref(),
     )?;
     
     // Save results

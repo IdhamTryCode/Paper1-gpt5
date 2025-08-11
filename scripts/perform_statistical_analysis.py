@@ -316,9 +316,24 @@ def main():
     analyzer = StatisticalAnalyzer(args.confidence_level)
     analysis_results = analyzer.perform_comprehensive_analysis(benchmark_results)
     
-    # Save results
+    # Save results (ensure numpy types are JSON-serializable)
+    def _json_default(o):
+        try:
+            import numpy as np  # local import to avoid hard dep if unused
+            if isinstance(o, (np.bool_,)):
+                return bool(o)
+            if isinstance(o, (np.integer,)):
+                return int(o)
+            if isinstance(o, (np.floating,)):
+                return float(o)
+            if isinstance(o, np.ndarray):
+                return o.tolist()
+        except Exception:
+            pass
+        return str(o)
+
     with open(args.output, 'w') as f:
-        json.dump(analysis_results, f, indent=2)
+        json.dump(analysis_results, f, indent=2, default=_json_default)
     
     # Print summary
     summary = analysis_results['summary']

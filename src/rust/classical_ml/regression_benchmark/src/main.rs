@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -9,14 +9,15 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use linfa::prelude::*;
 use linfa_linear::LinearRegression;
-use ndarray::{Array1, Array2, Axis, s};
+use linfa_elasticnet::ElasticNet;
+use ndarray::{Array1, Array2, s};
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
-use sysinfo::{System, SystemExt, CpuExt};
+use sysinfo::{System, SystemExt, CpuExt, ProcessExt};
 use uuid::Uuid;
-use log::{info, warn, error};
+use log::info;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -64,6 +65,12 @@ struct Args {
     /// Enable profiling
     #[arg(long)]
     enable_profiling: bool,
+    
+    /// Optional CSV paths for parity with Python: X and y files without header
+    #[arg(long)]
+    data_csv: Option<String>,
+    #[arg(long)]
+    targets_csv: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -154,12 +161,18 @@ struct BenchmarkResult {
     metadata: HashMap<String, serde_json::Value>,
 }
 
+enum BaseModel { Linear(LinearRegression), RidgeElasticNet { alpha: f64 } }
+
+type FittedElastic = linfa_elasticnet::ElasticNet<f64>;
+enum FittedModel { LinfaLinear(linfa_linear::FittedLinearRegression<f64>), LinfaElastic(FittedElastic) }
+
 struct EnhancedRegressionBenchmark {
     framework: String,
     resource_monitor: EnhancedResourceMonitor,
     rng: StdRng,
     enable_profiling: bool,
     profiling_data: HashMap<String, f64>,
+    y_train_mean: Option<f64>,
 }
 
 impl EnhancedRegressionBenchmark {
@@ -173,6 +186,7 @@ impl EnhancedRegressionBenchmark {
             rng,
             enable_profiling,
             profiling_data: HashMap::new(),
+            y_train_mean: None,
         }
     }
 
@@ -185,6 +199,31 @@ impl EnhancedRegressionBenchmark {
             "synthetic_sparse" => self.generate_synthetic_dataset(1000, 50, 5, 0.1, n_samples),
             _ => Err(anyhow::anyhow!("Unknown dataset: {}", dataset_name)),
         }
+    }
+
+    fn load_dataset_from_csv(&self, x_path: &str, y_path: &str) -> Result<(Array2<f64>, Array1<f64>)> {
+        let x_content = std::fs::read_to_string(x_path)?;
+        let y_content = std::fs::read_to_string(y_path)?;
+        let mut x_rows: Vec<f64> = Vec::new();
+        let mut ncols: Option<usize> = None;
+        let mut nrows: usize = 0;
+        for line in x_content.lines() {
+            if line.trim().is_empty() { continue; }
+            let cols: Vec<&str> = line.trim().split(',').collect();
+            if let Some(exp) = ncols { if exp != cols.len() { return Err(anyhow::anyhow!("Inconsistent column count in {}", x_path)); } } else { ncols = Some(cols.len()); }
+            for v in cols { x_rows.push(v.parse::<f64>().map_err(|e| anyhow::anyhow!("Failed parsing '{}': {}", v, e))?); }
+            nrows += 1;
+        }
+        let nc = ncols.ok_or_else(|| anyhow::anyhow!("Empty CSV: {}", x_path))?;
+        let x = Array2::from_shape_vec((nrows, nc), x_rows)?;
+        let mut y_vals: Vec<f64> = Vec::new();
+        for line in y_content.lines() {
+            if line.trim().is_empty() { continue; }
+            y_vals.push(line.trim().parse::<f64>().map_err(|e| anyhow::anyhow!("Failed parsing target '{}': {}", line, e))?);
+        }
+        if y_vals.len() != nrows { return Err(anyhow::anyhow!("Targets length {} does not match rows {}", y_vals.len(), nrows)); }
+        let y = Array1::from_vec(y_vals);
+        Ok((x, y))
     }
 
     fn load_boston_dataset(&self, n_samples: Option<usize>) -> Result<(Array2<f64>, Array1<f64>)> {
@@ -312,67 +351,147 @@ impl EnhancedRegressionBenchmark {
         Ok((x, y))
     }
 
-    fn create_model(&mut self, algorithm: &str, _hyperparams: &HashMap<String, f64>) -> Result<LinearRegression> {
+    fn create_model(&mut self, algorithm: &str, hyperparams: &HashMap<String, f64>) -> Result<BaseModel> {
         match algorithm {
-            "linear" => Ok(LinearRegression::new()),
+            "linear" => Ok(BaseModel::Linear(LinearRegression::new())),
+            // If alpha absent, set to negative to trigger CV selection later
+            "ridge" => Ok(BaseModel::RidgeElasticNet { alpha: *hyperparams.get("alpha").unwrap_or(&-1.0) }),
             _ => Err(anyhow::anyhow!("Unknown algorithm: {}", algorithm)),
         }
     }
 
-    fn preprocess_data(&self, x: &Array2<f64>, y: &Array1<f64>) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>, Array1<f64>)> {
-        // Simple train-test split (80-20)
+    fn preprocess_data(&mut self, x: &Array2<f64>, y: &Array1<f64>) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>, Array1<f64>)> {
+        // Shuffle with deterministic seed (42) then 80/20 split to mirror sklearn train_test_split(random_state=42)
         let n_samples = x.shape()[0];
+        let n_features = x.shape()[1];
+        let mut indices: Vec<usize> = (0..n_samples).collect();
+        indices.shuffle(&mut self.rng);
+        // Reorder X and y according to shuffled indices
+        let mut x_shuf = Array2::zeros((n_samples, n_features));
+        let mut y_shuf = Array1::zeros(n_samples);
+        for (new_i, &old_i) in indices.iter().enumerate() {
+            x_shuf.row_mut(new_i).assign(&x.row(old_i));
+            y_shuf[new_i] = y[old_i];
+        }
         let n_train = (n_samples as f64 * 0.8) as usize;
-        
-        let x_train = x.slice(s![..n_train, ..]).to_owned();
-        let x_test = x.slice(s![n_train.., ..]).to_owned();
-        let y_train = y.slice(s![..n_train]).to_owned();
-        let y_test = y.slice(s![n_train..]).to_owned();
-        
+        let mut x_train = x_shuf.slice(s![..n_train, ..]).to_owned();
+        let mut x_test = x_shuf.slice(s![n_train.., ..]).to_owned();
+        let y_train = y_shuf.slice(s![..n_train]).to_owned();
+        let y_test = y_shuf.slice(s![n_train..]).to_owned();
+        // Center y by train mean for ridge stability; store mean to add back
+        let y_mean = y_train.mean().unwrap();
+        self.y_train_mean = Some(y_mean);
+        // Standardize by train statistics
+        let means = x_train.mean_axis(ndarray::Axis(0)).unwrap();
+        let stds = x_train.std_axis(ndarray::Axis(0), 0.0);
+        for j in 0..x_train.ncols() {
+            let m = means[j];
+            let s = if stds[j] == 0.0 { 1.0 } else { stds[j] };
+            for i in 0..x_train.nrows() { x_train[[i,j]] = (x_train[[i,j]] - m) / s; }
+            for i in 0..x_test.nrows() { x_test[[i,j]] = (x_test[[i,j]] - m) / s; }
+        }
         info!("Data preprocessed: train={:?}, test={:?}", x_train.shape(), x_test.shape());
-        Ok((x_train, x_test, y_train, y_test))
+        Ok((x_train, x_test, &y_train - y_mean, &y_test - y_mean))
     }
 
-    fn train_model(&mut self, model: &LinearRegression, x_train: &Array2<f64>, y_train: &Array1<f64>) -> Result<(f64, ResourceMetrics, linfa_linear::FittedLinearRegression<f64>)> {
+    fn train_model(&mut self, model: &BaseModel, x_train: &Array2<f64>, y_train: &Array1<f64>) -> Result<(f64, ResourceMetrics, FittedModel)> {
         self.resource_monitor.start_monitoring();
         let start_time = Instant::now();
-        
-        // Train the model
-        let dataset = Dataset::new(x_train.clone(), y_train.clone());
-        let fitted_model = model.fit(&dataset)?;
-        
+
+        let fitted = match model {
+            BaseModel::Linear(lm) => {
+                let dataset = Dataset::new(x_train.clone(), y_train.clone());
+                match lm.fit(&dataset) {
+                    Ok(fitted_model) => FittedModel::LinfaLinear(fitted_model),
+                    Err(e) => {
+                        info!(
+                            "Linear regression fit failed ({}); falling back to Ridge (ElasticNet L2) with small alpha",
+                            e
+                        );
+                        let ridge_alpha = 1e-6; // tiny L2 to stabilize when X'X is singular
+                        let fitted = ElasticNet::params()
+                            .penalty(ridge_alpha)
+                            .l1_ratio(0.0)
+                            .fit(&dataset)?;
+                        FittedModel::LinfaElastic(fitted)
+                    }
+                }
+            }
+            BaseModel::RidgeElasticNet { alpha } => {
+                let mut best_alpha = *alpha;
+                if best_alpha <= 0.0 {
+                    // Simple 5-fold CV on train to select alpha
+                    let grid = [1e-4, 1e-3, 1e-2, 1e-1, 1.0];
+                    let k = 5usize;
+                    let n = x_train.nrows();
+                    let fold_size = (n + k - 1) / k;
+                    let mut best_mse = f64::INFINITY;
+                    for &a in &grid {
+                        let mut mses = Vec::new();
+                        for fold in 0..k {
+                            let start = fold * fold_size;
+                            let end = ((fold + 1) * fold_size).min(n);
+                            if start >= end { continue; }
+                            let x_val = x_train.slice(s![start..end, ..]).to_owned();
+                            let y_val = y_train.slice(s![start..end]).to_owned();
+                            let x_trn_top = x_train.slice(s![..start, ..]).to_owned();
+                            let y_trn_top = y_train.slice(s![..start]).to_owned();
+                            let x_trn_bot = x_train.slice(s![end.., ..]).to_owned();
+                            let y_trn_bot = y_train.slice(s![end..]).to_owned();
+                            let x_trn = ndarray::concatenate(ndarray::Axis(0), &[x_trn_top.view(), x_trn_bot.view()]).unwrap();
+                            let y_trn = ndarray::concatenate(ndarray::Axis(0), &[y_trn_top.view(), y_trn_bot.view()]).unwrap();
+                            let ds = Dataset::new(x_trn, y_trn);
+                            let m = ElasticNet::params().penalty(a).l1_ratio(0.0).fit(&ds)?;
+                            let y_hat = m.predict(&x_val);
+                            let mse = self.calculate_mse(&y_val, &y_hat);
+                            mses.push(mse);
+                        }
+                        if !mses.is_empty() {
+                            let mean_mse = mses.iter().sum::<f64>() / mses.len() as f64;
+                            if mean_mse < best_mse { best_mse = mean_mse; best_alpha = a; }
+                        }
+                    }
+                    // fall back if still invalid
+                    if best_alpha <= 0.0 { best_alpha = 0.1; }
+                }
+                let dataset = Dataset::new(x_train.clone(), y_train.clone());
+                let fitted = ElasticNet::params().penalty(best_alpha).l1_ratio(0.0).fit(&dataset)?;
+                FittedModel::LinfaElastic(fitted)
+            }
+        };
+
         let training_time = start_time.elapsed().as_secs_f64();
         let resource_metrics = self.resource_monitor.stop_monitoring();
-        
-        // Calculate model statistics
-        let n_nonzero = 0usize;
-        let sparsity = 0.0f64;
-        
+
         // Store profiling data
         if self.enable_profiling {
             self.profiling_data.insert("training_time_seconds".to_string(), training_time);
-            self.profiling_data.insert("model_sparsity".to_string(), sparsity);
-            self.profiling_data.insert("n_nonzero_coefficients".to_string(), n_nonzero as f64);
         }
-        
-        Ok((training_time, resource_metrics, fitted_model))
+
+        Ok((training_time, resource_metrics, fitted))
     }
 
-    fn evaluate_with_model(&self, fitted: &linfa_linear::FittedLinearRegression<f64>, x_test: &Array2<f64>, y_test: &Array1<f64>) -> Result<HashMap<String, f64>> {
-        let y_pred = fitted.predict(x_test);
+    fn evaluate_with_model(&self, fitted: &FittedModel, x_test: &Array2<f64>, y_test: &Array1<f64>) -> Result<HashMap<String, f64>> {
+        let mut y_pred = match fitted {
+            FittedModel::LinfaLinear(m) => m.predict(x_test),
+            FittedModel::LinfaElastic(m) => m.predict(x_test),
+        };
+        // Add back mean to compare on original scale
+        if let Some(mu) = self.y_train_mean { y_pred = y_pred + mu; }
+        let y_test_orig = if let Some(mu) = self.y_train_mean { y_test + mu } else { y_test.clone() };
         
         // Calculate comprehensive metrics
-        let mse = self.calculate_mse(y_test, &y_pred);
+        let mse = self.calculate_mse(&y_test_orig, &y_pred);
         let rmse = mse.sqrt();
-        let mae = self.calculate_mae(y_test, &y_pred);
-        let r2 = self.calculate_r2_score(y_test, &y_pred);
+        let mae = self.calculate_mae(&y_test_orig, &y_pred);
+        let r2 = self.calculate_r2_score(&y_test_orig, &y_pred);
         
         // Calculate additional metrics
-        let mape = self.calculate_mape(y_test, &y_pred);
-        let explained_variance = self.calculate_explained_variance(y_test, &y_pred);
+        let mape = self.calculate_mape(&y_test_orig, &y_pred);
+        let explained_variance = self.calculate_explained_variance(&y_test_orig, &y_pred);
         
         // Calculate residuals statistics
-        let residuals = y_test - &y_pred;
+        let residuals = &y_test_orig - &y_pred;
         let residual_std = residuals.std(0.0);
         let residual_skew = self.calculate_skewness(&residuals);
         let residual_kurtosis = self.calculate_kurtosis(&residuals);
@@ -475,7 +594,7 @@ impl EnhancedRegressionBenchmark {
         kurtosis - 3.0
     }
 
-    fn run_inference_benchmark(&self, fitted: &linfa_linear::FittedLinearRegression<f64>, x_test: &Array2<f64>, batch_sizes: &[usize]) -> Result<HashMap<String, f64>> {
+    fn run_inference_benchmark(&self, fitted: &FittedModel, x_test: &Array2<f64>, batch_sizes: &[usize]) -> Result<HashMap<String, f64>> {
         
         let mut latencies = Vec::new();
         let mut throughputs = Vec::new();
@@ -484,14 +603,20 @@ impl EnhancedRegressionBenchmark {
             let mut batch_latencies = Vec::new();
             
             // Warm-up runs
-            for _ in 0..10 {
-                let _ = fitted.predict(&x_test.slice(s![..batch_size, ..]).to_owned());
-            }
+                for _ in 0..10 {
+                    let _ = match fitted {
+                        FittedModel::LinfaLinear(m) => m.predict(&x_test.slice(s![..batch_size, ..]).to_owned()),
+                        FittedModel::LinfaElastic(m) => m.predict(&x_test.slice(s![..batch_size, ..]).to_owned()),
+                    };
+                }
             
             // Benchmark runs
             for _ in 0..100 {
                 let start_time = Instant::now();
-                let _ = fitted.predict(&x_test.slice(s![..batch_size, ..]).to_owned());
+                let _ = match fitted {
+                    FittedModel::LinfaLinear(m) => m.predict(&x_test.slice(s![..batch_size, ..]).to_owned()),
+                    FittedModel::LinfaElastic(m) => m.predict(&x_test.slice(s![..batch_size, ..]).to_owned()),
+                };
                 let latency = start_time.elapsed().as_secs_f64() * 1000.0; // Convert to ms
                 batch_latencies.push(latency);
             }
@@ -591,11 +716,17 @@ impl EnhancedRegressionBenchmark {
                      algorithm: &str, 
                      hyperparams: &HashMap<String, f64>,
                      run_id: &str,
-                     mode: &str) -> Result<BenchmarkResult> {
+                     mode: &str,
+                     data_csv: Option<&str>,
+                     targets_csv: Option<&str>) -> Result<BenchmarkResult> {
         info!("Starting benchmark: {}, {}, {}", dataset, algorithm, mode);
         
         // Load and preprocess data
-        let (x, y) = self.load_dataset(dataset, None)?;
+        let (x, y) = if let (Some(xp), Some(yp)) = (data_csv, targets_csv) {
+            self.load_dataset_from_csv(xp, yp)?
+        } else {
+            self.load_dataset(dataset, None)?
+        };
         let (x_train, x_test, y_train, y_test) = self.preprocess_data(&x, &y)?;
         
         // Create model
@@ -800,15 +931,25 @@ impl EnhancedResourceMonitor {
 
     fn get_memory_usage(&self) -> usize {
         let mut sys = System::new_all();
-        sys.refresh_all();
-        sys.used_memory() as usize
+        let pid = sysinfo::Pid::from(self.process_id as usize);
+        sys.refresh_process(pid);
+        if let Some(p) = sys.process(pid) {
+            // memory() returns KiB
+            (p.memory() as usize) * 1024
+        } else {
+            0
+        }
     }
 
     fn get_cpu_usage(&self) -> f32 {
-        // Get system CPU usage
-        let mut sys = System::new();
-        sys.refresh_cpu();
-        sys.global_cpu_info().cpu_usage()
+        let mut sys = System::new_all();
+        let pid = sysinfo::Pid::from(self.process_id as usize);
+        sys.refresh_process(pid);
+        if let Some(p) = sys.process(pid) {
+            p.cpu_usage()
+        } else {
+            0.0
+        }
     }
 
     fn get_gpu_metrics(&self) -> HashMap<String, Option<f64>> {
@@ -922,7 +1063,9 @@ fn main() -> Result<()> {
         &args.algorithm,
         &hyperparams,
         &run_id,
-        &args.mode
+        &args.mode,
+        args.data_csv.as_deref(),
+        args.targets_csv.as_deref()
     )?;
     
     // Save results

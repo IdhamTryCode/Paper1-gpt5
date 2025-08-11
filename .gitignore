@@ -96,3 +96,6 @@ docs/_build/
 # Large datasets
 datasets/
 models/ 
+
+libtorch/
+libtorch_full/

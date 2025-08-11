@@ -1,17 +1,18 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
-use std::error::Error;
+use std::time::Instant;
 use std::fs;
 use std::path::Path;
 
 use clap::Parser;
 use linfa::prelude::*;
+use linfa::dataset::DatasetBase;
+use linfa_clustering::KMeans;
 use ndarray::{Array1, Array2, s};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
-use sysinfo::{System, SystemExt, CpuExt};
+use sysinfo::{System, SystemExt, ProcessExt};
 use anyhow::Result;
 
 #[derive(Parser, Debug)]
@@ -26,7 +27,7 @@ struct Args {
     #[arg(short, long)]
     algorithm: String,
     
-    #[arg(short, long, default_value = "{}")]
+    #[arg(long, default_value = "{}")]
     hyperparams: String,
     
     #[arg(short, long)]
@@ -34,6 +35,10 @@ struct Args {
     
     #[arg(short, long, default_value = ".")]
     output_dir: String,
+    
+    /// Optional CSV path to load features (no header). Ensures parity with Python datasets
+    #[arg(long)]
+    data_csv: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -116,6 +121,10 @@ struct ClusteringBenchmark {
     framework: String,
     model: Option<Box<dyn ClusteringModel>>,
     resource_monitor: ResourceMonitor,
+    // linfa-based path
+    use_linfa_kmeans: bool,
+    linfa_kmeans_clusters: usize,
+    last_labels: Option<ndarray::Array1<usize>>,
 }
 
 trait ClusteringModel {
@@ -337,6 +346,9 @@ impl ClusteringBenchmark {
             framework,
             model: None,
             resource_monitor: ResourceMonitor::new(),
+            use_linfa_kmeans: false,
+            linfa_kmeans_clusters: 3,
+            last_labels: None,
         }
     }
     
@@ -348,6 +360,26 @@ impl ClusteringBenchmark {
             "synthetic" => self.load_synthetic_dataset(),
             _ => Err(anyhow::anyhow!("Unknown dataset: {}", dataset_name)),
         }
+    }
+
+    fn load_dataset_from_csv(&self, path: &str) -> Result<Array2<f64>> {
+        let content = std::fs::read_to_string(path)?;
+        let mut rows: Vec<f64> = Vec::new();
+        let mut ncols: Option<usize> = None;
+        let mut nrows: usize = 0;
+        for line in content.lines() {
+            if line.trim().is_empty() { continue; }
+            let cols: Vec<&str> = line.trim().split(',').collect();
+            let c = cols.len();
+            if let Some(expected) = ncols { if expected != c { return Err(anyhow::anyhow!("Inconsistent column count in {}", path)); } } else { ncols = Some(c); }
+            for v in cols {
+                rows.push(v.parse::<f64>().map_err(|e| anyhow::anyhow!("Failed parsing '{}': {}", v, e))?);
+            }
+            nrows += 1;
+        }
+        let nc = ncols.ok_or_else(|| anyhow::anyhow!("Empty CSV: {}", path))?;
+        let arr = Array2::from_shape_vec((nrows, nc), rows)?;
+        Ok(arr)
     }
     
     fn load_iris_dataset(&self) -> Result<Array2<f64>> {
@@ -459,7 +491,10 @@ impl ClusteringBenchmark {
         match algorithm {
             "kmeans" => {
                 let n_clusters = *hyperparams.get("n_clusters").unwrap_or(&3.0) as usize;
-                self.model = Some(Box::new(KMeansModel::new(n_clusters)));
+                // Prefer linfa-clustering KMeans for fidelity
+                self.use_linfa_kmeans = true;
+                self.linfa_kmeans_clusters = n_clusters;
+                self.model = None;
             }
             "dbscan" => {
                 let eps = hyperparams.get("eps").unwrap_or(&0.5);
@@ -476,7 +511,14 @@ impl ClusteringBenchmark {
         
         let start_time = Instant::now();
         
-        if let Some(ref mut model) = self.model {
+        if self.use_linfa_kmeans {
+            let k = self.linfa_kmeans_clusters.max(2);
+            let dummy = ndarray::Array1::<usize>::zeros(data.nrows());
+            let ds: DatasetBase<ndarray::ArrayView2<'_, f64>, ndarray::Array1<usize>> = DatasetBase::new(data.view(), dummy);
+            let fitted = KMeans::params(k).max_n_iterations(300).fit(&ds)?;
+            let labels = fitted.predict(&ds);
+            self.last_labels = Some(labels);
+        } else if let Some(ref mut model) = self.model {
             model.fit(data)?;
         } else {
             return Err(anyhow::anyhow!("Model not created"));
@@ -489,18 +531,25 @@ impl ClusteringBenchmark {
     }
     
     fn evaluate_model(&self, data: &Array2<f64>) -> Result<HashMap<String, f64>> {
-        if let Some(ref model) = self.model {
-            let predictions = model.predict(data)?;
+        let predictions: Array1<usize> = if self.use_linfa_kmeans {
+            if let Some(ref labels) = self.last_labels {
+                labels.clone()
+            } else {
+                return Err(anyhow::anyhow!("No labels available from linfa KMeans"));
+            }
+        } else if let Some(ref model) = self.model {
+            model.predict(data)?
+        } else {
+            return Err(anyhow::anyhow!("Model not trained"));
+        };
             
             let mut metrics = HashMap::new();
             
             // Calculate inertia (for KMeans)
-            if let Some(inertia) = model.get_inertia() {
-                metrics.insert("inertia".to_string(), inertia);
-            }
+            // Not available directly from linfa; left as None
             
             // Calculate silhouette score
-            if let Some(silhouette) = model.get_silhouette_score(data, &predictions) {
+            if let Some(silhouette) = self.simple_silhouette(data, &predictions) {
                 metrics.insert("silhouette_score".to_string(), silhouette);
             }
             
@@ -510,9 +559,39 @@ impl ClusteringBenchmark {
             metrics.insert("n_clusters".to_string(), uniq.len() as f64);
             
             Ok(metrics)
-        } else {
-            Err(anyhow::anyhow!("Model not trained"))
+        
+    }
+
+    fn simple_silhouette(&self, data: &Array2<f64>, labels: &Array1<usize>) -> Option<f64> {
+        // Simplified silhouette calculation (same as before)
+        let n_samples = data.nrows();
+        let mut silhouette_sum = 0.0;
+        let mut valid_samples = 0;
+        for i in 0..n_samples {
+            let mut intra_cluster_dist = 0.0;
+            let mut inter_cluster_dist = f64::MAX;
+            let current_label = labels[i];
+            let mut intra_count = 0;
+            for j in 0..n_samples {
+                if i != j {
+                    let dist = euclidean_distance(&data.row(i), &data.row(j));
+                    if labels[j] == current_label {
+                        intra_cluster_dist += dist;
+                        intra_count += 1;
+                    } else {
+                        inter_cluster_dist = inter_cluster_dist.min(dist);
+                    }
+                }
+            }
+            if intra_count > 0 {
+                intra_cluster_dist /= intra_count as f64;
+                let silhouette = (inter_cluster_dist - intra_cluster_dist) /
+                                 (inter_cluster_dist.max(intra_cluster_dist));
+                silhouette_sum += silhouette;
+                valid_samples += 1;
+            }
         }
+        if valid_samples > 0 { Some(silhouette_sum / valid_samples as f64) } else { None }
     }
     
     fn run_inference_benchmark(&self, data: &Array2<f64>, batch_sizes: &[usize]) -> Result<HashMap<String, f64>> {
@@ -589,10 +668,22 @@ impl ClusteringBenchmark {
                      algorithm: &str, 
                      hyperparams: &HashMap<String, f64>,
                      run_id: &str,
-                     mode: &str) -> Result<BenchmarkResult> {
+                     mode: &str,
+                     data_csv: Option<&str>) -> Result<BenchmarkResult> {
         
-        // Load dataset
-        let data = self.load_dataset(dataset)?;
+        // Load dataset (prefer CSV if provided for parity)
+        let mut data = if let Some(path) = data_csv { self.load_dataset_from_csv(path)? } else { self.load_dataset(dataset)? };
+        
+        // Standardize features (match Python's StandardScaler behavior)
+        {
+            let means = data.mean_axis(ndarray::Axis(0)).unwrap();
+            let stds = data.std_axis(ndarray::Axis(0), 0.0);
+            for j in 0..data.ncols() {
+                let m = means[j];
+                let s = if stds[j] == 0.0 { 1.0 } else { stds[j] };
+                for i in 0..data.nrows() { data[[i,j]] = (data[[i,j]] - m) / s; }
+            }
+        }
         
         // Create model
         self.create_model(algorithm, hyperparams)?;
@@ -714,6 +805,7 @@ struct ResourceMonitor {
     memory_samples: Vec<u64>,
     cpu_samples: Vec<f32>,
     start_time: Option<Instant>,
+    process_id: u32,
 }
 
 impl ResourceMonitor {
@@ -724,37 +816,39 @@ impl ResourceMonitor {
             memory_samples: Vec::new(),
             cpu_samples: Vec::new(),
             start_time: None,
+            process_id: std::process::id(),
         }
     }
     
     fn start_monitoring(&mut self) {
         let mut sys = System::new_all();
-        sys.refresh_all();
-        
+        let pid = sysinfo::Pid::from(self.process_id as usize);
+        sys.refresh_process(pid);
         self.start_time = Some(Instant::now());
-        self.start_memory = Some(sys.used_memory());
-        self.peak_memory = sys.used_memory();
-        self.memory_samples = vec![sys.used_memory()];
-        self.cpu_samples = vec![sys.global_cpu_info().cpu_usage()];
+        let mem = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
+        self.start_memory = Some(mem);
+        self.peak_memory = mem;
+        self.memory_samples = vec![mem];
+        self.cpu_samples = vec![sys.process(pid).map(|p| p.cpu_usage()).unwrap_or(0.0)];
     }
     
     fn stop_monitoring(&mut self) -> ResourceMetrics {
         let mut sys = System::new_all();
-        sys.refresh_all();
-        
-        let final_memory = sys.used_memory();
-        let final_cpu = sys.global_cpu_info().cpu_usage();
+        let pid = sysinfo::Pid::from(self.process_id as usize);
+        sys.refresh_process(pid);
+        let final_memory = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
+        let final_cpu = sys.process(pid).map(|p| p.cpu_usage()).unwrap_or(0.0);
         
         self.memory_samples.push(final_memory);
         self.cpu_samples.push(final_cpu);
         
-        let peak_memory = self.memory_samples.iter().max().unwrap_or(&0);
+        let peak_memory = *self.memory_samples.iter().max().unwrap_or(&0);
         let avg_memory = self.memory_samples.iter().sum::<u64>() / self.memory_samples.len() as u64;
         let avg_cpu = self.cpu_samples.iter().sum::<f32>() / self.cpu_samples.len() as f32;
         
         ResourceMetrics {
-            peak_memory_mb: *peak_memory as f64 / (1024.0 * 1024.0),
-            average_memory_mb: avg_memory as f64 / (1024.0 * 1024.0),
+            peak_memory_mb: peak_memory as f64 / 1024.0, // KiB to MB
+            average_memory_mb: avg_memory as f64 / 1024.0,
             cpu_utilization_percent: avg_cpu as f64,
             peak_gpu_memory_mb: None,
             average_gpu_memory_mb: None,
@@ -784,6 +878,7 @@ fn main() -> Result<()> {
         &hyperparams,
         &run_id,
         &args.mode,
+        args.data_csv.as_deref(),
     )?;
     
     // Save results

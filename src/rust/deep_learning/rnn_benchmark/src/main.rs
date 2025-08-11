@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use clap::Parser;
-use tch::{nn, nn::OptimizerConfig, Device, Tensor, Kind};
+use tch::{nn, nn::Module, nn::OptimizerConfig, nn::RNN, Device, Tensor, Kind};
 use ndarray::{Array1, Array2};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ struct Args {
     #[arg(short, long)]
     architecture: String,
     
-    #[arg(short, long, default_value = "{}")]
+    #[arg(long, default_value = "{}")]
     hyperparams: String,
     
     #[arg(short, long)]
@@ -118,13 +118,18 @@ struct SimpleRNN {
 impl SimpleRNN {
     fn new(vs: &nn::Path, input_size: i64, hidden_size: i64, num_layers: i64, num_classes: i64) -> Self {
         Self {
-            rnn: nn::lstm(vs / "lstm", input_size, hidden_size, nn::LstmConfig::default().layers(num_layers)),
+            rnn: nn::lstm(
+                vs / "lstm",
+                input_size,
+                hidden_size,
+                nn::RNNConfig { num_layers, ..Default::default() }
+            ),
             fc: nn::linear(vs / "fc", hidden_size, num_classes, Default::default()),
         }
     }
     
-    fn forward(&self, xs: &Tensor) -> Tensor {
-        let (output, _) = self.rnn.forward(xs, None);
+    fn forward_impl(&self, xs: &Tensor) -> Tensor {
+        let (output, _) = self.rnn.seq(&xs);
         let last_output = output.select(1, -1);
         self.fc.forward(&last_output)
     }
@@ -138,13 +143,18 @@ struct GRUModel {
 impl GRUModel {
     fn new(vs: &nn::Path, input_size: i64, hidden_size: i64, num_layers: i64, num_classes: i64) -> Self {
         Self {
-            gru: nn::gru(vs / "gru", input_size, hidden_size, nn::GruConfig::default().layers(num_layers)),
+            gru: nn::gru(
+                vs / "gru",
+                input_size,
+                hidden_size,
+                nn::RNNConfig { num_layers, ..Default::default() }
+            ),
             fc: nn::linear(vs / "fc", hidden_size, num_classes, Default::default()),
         }
     }
     
-    fn forward(&self, xs: &Tensor) -> Tensor {
-        let (output, _) = self.gru.forward(xs, None);
+    fn forward_impl(&self, xs: &Tensor) -> Tensor {
+        let (output, _) = self.gru.seq(&xs);
         let last_output = output.select(1, -1);
         self.fc.forward(&last_output)
     }
@@ -153,38 +163,24 @@ impl GRUModel {
 struct RNNBenchmark {
     framework: String,
     device: Device,
+    vs: nn::VarStore,
     model: Option<Box<dyn RNNModel>>,
     resource_monitor: ResourceMonitor,
 }
 
 trait RNNModel {
     fn forward(&self, xs: &Tensor) -> Tensor;
-    fn parameters(&self) -> Vec<Tensor>;
 }
 
 impl RNNModel for SimpleRNN {
     fn forward(&self, xs: &Tensor) -> Tensor {
-        self.forward(xs)
-    }
-    
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = Vec::new();
-        params.extend(self.rnn.parameters());
-        params.extend(self.fc.parameters());
-        params
+        self.forward_impl(xs)
     }
 }
 
 impl RNNModel for GRUModel {
     fn forward(&self, xs: &Tensor) -> Tensor {
-        self.forward(xs)
-    }
-    
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = Vec::new();
-        params.extend(self.gru.parameters());
-        params.extend(self.fc.parameters());
-        params
+        self.forward_impl(xs)
     }
 }
 
@@ -199,6 +195,7 @@ impl RNNBenchmark {
         Self {
             framework,
             device,
+            vs: nn::VarStore::new(device),
             model: None,
             resource_monitor: ResourceMonitor::new(),
         }
@@ -206,6 +203,7 @@ impl RNNBenchmark {
     
     fn load_dataset(&self, dataset_name: &str) -> Result<(Tensor, Tensor)> {
         match dataset_name {
+            "synthetic" => self.load_sequence_classification_dataset(),
             "sine_wave" => self.load_sine_wave_dataset(),
             "sequence_classification" => self.load_sequence_classification_dataset(),
             "time_series" => self.load_time_series_dataset(),
@@ -238,8 +236,9 @@ impl RNNBenchmark {
             targets.push(i % 3); // 3 classes
         }
         
-        let data_tensor = Tensor::of_slice(&data).view([n_samples as i64, sequence_length as i64, n_features as i64]);
-        let targets_tensor = Tensor::of_slice(&targets);
+        let data_tensor = Tensor::f_from_slice(&data).unwrap().view([n_samples as i64, sequence_length as i64, n_features as i64]).to_kind(Kind::Float);
+        let targets: Vec<i64> = targets.into_iter().map(|v| v as i64).collect();
+        let targets_tensor = Tensor::f_from_slice(&targets).unwrap();
         
         Ok((data_tensor.to_device(self.device), targets_tensor.to_device(self.device)))
     }
@@ -258,8 +257,8 @@ impl RNNBenchmark {
             let class = i % 4; // 4 classes
             let mut sequence = Vec::new();
             
-            for t in 0..sequence_length {
-                for f in 0..n_features {
+            for _t in 0..sequence_length {
+                for _f in 0..n_features {
                     let base_value = match class {
                         0 => 0.0,
                         1 => 1.0,
@@ -276,8 +275,9 @@ impl RNNBenchmark {
             targets.push(class as i64);
         }
         
-        let data_tensor = Tensor::of_slice(&data).view([n_samples as i64, sequence_length as i64, n_features as i64]);
-        let targets_tensor = Tensor::of_slice(&targets);
+        let data_tensor = Tensor::f_from_slice(&data).unwrap().view([n_samples as i64, sequence_length as i64, n_features as i64]).to_kind(Kind::Float);
+        let targets: Vec<i64> = targets.into_iter().map(|v| v as i64).collect();
+        let targets_tensor = Tensor::f_from_slice(&targets).unwrap();
         
         Ok((data_tensor.to_device(self.device), targets_tensor.to_device(self.device)))
     }
@@ -311,23 +311,22 @@ impl RNNBenchmark {
             targets.push(i % 2); // Binary classification
         }
         
-        let data_tensor = Tensor::of_slice(&data).view([n_samples as i64, sequence_length as i64, n_features as i64]);
-        let targets_tensor = Tensor::of_slice(&targets);
+        let data_tensor = Tensor::f_from_slice(&data).unwrap().view([n_samples as i64, sequence_length as i64, n_features as i64]).to_kind(Kind::Float);
+        let targets: Vec<i64> = targets.into_iter().map(|v| v as i64).collect();
+        let targets_tensor = Tensor::f_from_slice(&targets).unwrap();
         
         Ok((data_tensor.to_device(self.device), targets_tensor.to_device(self.device)))
     }
     
     fn create_model(&mut self, architecture: &str, hyperparams: &HashMap<String, f64>) -> Result<()> {
-        let vs = nn::VarStore::new(self.device);
-        
-        let input_size = hyperparams.get("input_size").unwrap_or(&10.0) as i64;
-        let hidden_size = hyperparams.get("hidden_size").unwrap_or(&64.0) as i64;
-        let num_layers = hyperparams.get("num_layers").unwrap_or(&2.0) as i64;
-        let num_classes = hyperparams.get("num_classes").unwrap_or(&3.0) as i64;
+        let input_size = *hyperparams.get("input_size").unwrap_or(&10.0) as i64;
+        let hidden_size = *hyperparams.get("hidden_size").unwrap_or(&64.0) as i64;
+        let num_layers = *hyperparams.get("num_layers").unwrap_or(&2.0) as i64;
+        let num_classes = *hyperparams.get("num_classes").unwrap_or(&3.0) as i64;
         
         let model: Box<dyn RNNModel> = match architecture {
-            "lstm" => Box::new(SimpleRNN::new(&vs.root(), input_size, hidden_size, num_layers, num_classes)),
-            "gru" => Box::new(GRUModel::new(&vs.root(), input_size, hidden_size, num_layers, num_classes)),
+            "lstm" => Box::new(SimpleRNN::new(&self.vs.root(), input_size, hidden_size, num_layers, num_classes)),
+            "gru" => Box::new(GRUModel::new(&self.vs.root(), input_size, hidden_size, num_layers, num_classes)),
             _ => return Err(anyhow::anyhow!("Unknown architecture: {}", architecture)),
         };
         
@@ -344,8 +343,8 @@ impl RNNBenchmark {
         
         let start_time = Instant::now();
         
-        // Create optimizer
-        let mut opt = nn::Adam::default().build(&nn::VarStore::new(self.device), learning_rate)?;
+        // Create optimizer bound to the model parameters
+        let mut opt = nn::Adam::default().build(&self.vs, learning_rate)?;
         
         let mut losses = Vec::new();
         
@@ -361,12 +360,10 @@ impl RNNBenchmark {
             loss.backward();
             opt.step();
             
-            let loss_value = f64::from(loss);
+            let loss_value = loss.double_value(&[]);
             losses.push(loss_value);
             
-            if epoch % 5 == 0 {
-                println!("Epoch {}: Loss = {:.4}", epoch, loss_value);
-            }
+            println!("Epoch {}/{}: loss = {:.6}", epoch + 1, epochs, loss_value);
         }
         
         let training_time = start_time.elapsed().as_secs_f64();
@@ -381,13 +378,13 @@ impl RNNBenchmark {
             let predicted_labels = predictions.argmax(-1, false);
             
             // Calculate accuracy
-            let correct = predicted_labels.eq(y_test).sum(Kind::Float);
-            let total = y_test.size()[0];
-            let accuracy = f64::from(correct) / f64::from(total);
+            let correct = predicted_labels.eq_tensor(y_test).sum(Kind::Float);
+            let total = y_test.size()[0] as f64;
+            let accuracy = correct.double_value(&[]) / total;
             
             // Calculate loss
             let loss = predictions.cross_entropy_for_logits(y_test);
-            let loss_value = f64::from(loss);
+            let loss_value = loss.double_value(&[]);
             
             let mut metrics = HashMap::new();
             metrics.insert("accuracy".to_string(), accuracy);
@@ -480,19 +477,29 @@ impl RNNBenchmark {
         let y_train = y.narrow(0, 0, split_idx);
         let y_test = y.narrow(0, split_idx, n_samples - split_idx);
         
-        // Get hyperparameters
-        let epochs = hyperparams.get("epochs").unwrap_or(&10.0) as usize;
-        let learning_rate = hyperparams.get("learning_rate").unwrap_or(&0.001);
+        // Get hyperparameters and infer num_classes if not provided based on dataset
+        let epochs = *hyperparams.get("epochs").unwrap_or(&10.0) as usize;
+        let learning_rate = *hyperparams.get("learning_rate").unwrap_or(&0.001);
+        let mut hps = hyperparams.clone();
+        if !hps.contains_key("num_classes") {
+            let inferred = match dataset {
+                "synthetic" | "sequence_classification" => 4.0,
+                "sine_wave" => 3.0,
+                "time_series" => 2.0,
+                _ => 3.0,
+            };
+            hps.insert("num_classes".to_string(), inferred);
+        }
         
         // Create model
-        self.create_model(architecture, hyperparams)?;
+        self.create_model(architecture, &hps)?;
         
         // Get hardware configuration
         let hardware_config = self.get_hardware_config();
         
         if mode == "training" {
             // Training benchmark
-            let (training_time, resource_metrics) = self.train_model(&X_train, &y_train, epochs, *learning_rate)?;
+            let (training_time, resource_metrics) = self.train_model(&X_train, &y_train, epochs, learning_rate)?;
             let quality_metrics = self.evaluate_model(&X_test, &y_test)?;
             
             return Ok(BenchmarkResult {
@@ -528,17 +535,17 @@ impl RNNBenchmark {
                 metadata: {
                     let mut meta = HashMap::new();
                     meta.insert("architecture".to_string(), serde_json::Value::String(architecture.to_string()));
-                    meta.insert("hyperparameters".to_string(), serde_json::to_value(hyperparams)?);
+                     meta.insert("hyperparameters".to_string(), serde_json::to_value(&hps)?);
                     meta.insert("device".to_string(), serde_json::Value::String(format!("{:?}", self.device)));
                     meta.insert("epochs".to_string(), serde_json::Value::Number(serde_json::Number::from(epochs)));
-                    meta.insert("learning_rate".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(*learning_rate).unwrap()));
+                    meta.insert("learning_rate".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(learning_rate).unwrap()));
                     meta.insert("dataset_size".to_string(), serde_json::Value::Number(serde_json::Number::from(n_samples)));
                     meta
                 },
             });
         } else if mode == "inference" {
             // Train model first
-            self.train_model(&X_train, &y_train, epochs, *learning_rate)?;
+            self.train_model(&X_train, &y_train, epochs, learning_rate)?;
             
             // Inference benchmark
             let inference_metrics = self.run_inference_benchmark(&X_test, &[1, 16, 64])?;
@@ -583,10 +590,10 @@ impl RNNBenchmark {
                 metadata: {
                     let mut meta = HashMap::new();
                     meta.insert("architecture".to_string(), serde_json::Value::String(architecture.to_string()));
-                    meta.insert("hyperparameters".to_string(), serde_json::to_value(hyperparams)?);
+                     meta.insert("hyperparameters".to_string(), serde_json::to_value(&hps)?);
                     meta.insert("device".to_string(), serde_json::Value::String(format!("{:?}", self.device)));
                     meta.insert("epochs".to_string(), serde_json::Value::Number(serde_json::Number::from(epochs)));
-                    meta.insert("learning_rate".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(*learning_rate).unwrap()));
+                    meta.insert("learning_rate".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(learning_rate).unwrap()));
                     meta.insert("dataset_size".to_string(), serde_json::Value::Number(serde_json::Number::from(n_samples)));
                     meta
                 },
@@ -681,7 +688,7 @@ fn main() -> Result<()> {
     let output_path = Path::new(&args.output_dir).join(output_file);
     
     let json_result = serde_json::to_string_pretty(&result)?;
-    fs::write(output_path, json_result)?;
+    fs::write(&output_path, json_result)?;
     
     println!("Benchmark completed. Results saved to: {}", output_path.display());
     

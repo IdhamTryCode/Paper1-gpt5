@@ -21,9 +21,15 @@ Plan to reach 9.5+ overall:
    - Replace synthetic dataset stubs with proper loaders or bundled CSVs where referenced.
    - Improve metric calculations (SVM/clustering percentiles, proper accuracy/F1 where feasible).
    - Add GPU resource capture hooks where available; otherwise document limitations.
+   - Classical ML parity items:
+     - Implement Ridge (and optionally Lasso/ElasticNet) in `src/rust/classical_ml/regression_benchmark` to avoid singular-matrix failures and align with Python.
+     - Thread `--n-samples` from CLI into dataset loaders to ease small-sample smoke runs.
+     - Replace placeholder SVM with `linfa-svm` and placeholder KMeans/DBSCAN with `linfa-clustering` for fidelity comparable to scikit-learn.
+     - Adjust resource monitoring to process-level metrics (current sys-wide sampling inflates peak memory).
 
 3) LLM and RL realism (priority: medium)
    - For Rust LLM, document placeholder nature; optionally wire minimal real tokenization pipeline via candle/tokenizers if feasible.
+   - For Rust Classical ML SVM/Clustering, clearly document placeholder nature until `linfa`-backed implementations are in place.
    - For RL, factor shared env/utilities and add deterministic seeds and repeatability; add mean/std reporting parity with Python.
 
 4) Nextflow and reproducibility (priority: medium)
@@ -42,6 +48,18 @@ Execution tracker:
 - [x] Fix deprecated dataset in regression benchmark.
 - [x] Smoke workflow green for CNN, LLM, RL, RNN.
 - [x] Document venv setup and `-resume` flow for classical ML in `USERGUIDE.md`; link from `README.md` and `SPECS.md`.
+- [x] Add clustering metrics fields (`silhouette_score`, `inertia`) to `QualityMetrics` to unblock Python clustering outputs.
+- [x] Ran initial Classical ML compare runs; results saved under `work/classical_ml_compare/`:
+      - PY: regression (synthetic_linear, linear), SVM (iris, SVC), clustering (iris, KMeans)
+      - RS: SVM (iris, placeholder nearest-centroid), clustering (iris, simple KMeans stub)
+- [x] Add clustering metrics fields (`silhouette_score`, `inertia`) to `QualityMetrics` to unblock Python clustering outputs.
+- [x] Ran initial Classical ML compare runs; results saved under `work/classical_ml_compare/`:
+      - PY: regression (synthetic_linear, linear), SVM (iris, SVC), clustering (iris, KMeans)
+      - RS: SVM (iris, placeholder nearest-centroid), clustering (iris, linfa-kmeans), regression (ridge via GD)
+- [x] Implement Ridge path in Rust regression benchmark (gradient descent fallback) and generated `synthetic_linear_ridge_rs_training_results.json`.
+- [x] Switch Rust clustering to `linfa-clustering::KMeans` and generated `iris_kmeans_rs_linfa_training_results.json`.
+- [ ] Replace Rust SVM placeholder with `linfa-svm` classification and re-run comparison.
+- [ ] Calibrate Ridge hyperparameters or adopt `linfa-elasticnet` for numerically stable r² on low-variance splits.
 - [ ] Add smoke tests for Python/Rust execution JSON outputs.
 - [ ] Tighten Rust metrics and replace simplified percentiles.
 - [ ] Add small Nextflow profile + local run instructions.

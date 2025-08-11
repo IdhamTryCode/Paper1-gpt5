@@ -408,13 +408,17 @@ class EnhancedSVMBenchmark:
                      algorithm: str, 
                      hyperparams: Dict[str, Any],
                      run_id: str,
-                     mode: str = "training") -> BenchmarkResult:
+                     mode: str = "training",
+                     binary_base_class: Optional[int] = None) -> BenchmarkResult:
         """Run comprehensive benchmark with full analysis."""
         try:
             logger.info(f"Starting SVM benchmark: {dataset}, {algorithm}, {mode}")
             
             # Load dataset
             X, y = self.load_dataset(dataset)
+            # Optional: map to binary one-vs-rest for parity (class == base -> 1 else 0)
+            if binary_base_class is not None:
+                y = (y == binary_base_class).astype(int)
             
             # Preprocess data
             X_train, X_test, y_train, y_test = self.preprocess_data(X, y)
@@ -591,6 +595,7 @@ def main():
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output-dir", default=".")
     parser.add_argument("--enable-profiling", action="store_true")
+    parser.add_argument("--binary-base-class", type=int, default=None)
     
     args = parser.parse_args()
     
@@ -607,7 +612,8 @@ def main():
             args.algorithm,
             hyperparams,
             args.run_id,
-            args.mode
+            args.mode,
+            args.binary_base_class
         )
         
         # Save results

@@ -14,6 +14,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, Tuple
 from pathlib import Path
+from dataclasses import asdict
 import os
 import psutil
 import platform
@@ -260,7 +261,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"{args.dataset}_{args.architecture}_{args.run_id or 'run'}_{args.mode}_results.json"
     with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(result.__dict__, f, default=lambda o: o.__dict__, indent=2)
+        json.dump(asdict(result), f, indent=2, default=str)
     print(f"Benchmark completed. Results saved to: {out_file}")
 
 

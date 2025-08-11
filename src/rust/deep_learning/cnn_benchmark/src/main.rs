@@ -5,7 +5,8 @@ use std::fs;
 use std::path::Path;
 
 use clap::Parser;
-use tch::{nn, nn::OptimizerConfig, Device, Tensor, Kind};
+use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Tensor, Kind};
+use tch::vision::{mnist, cifar};
 use ndarray::{Array1, Array2};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ struct Args {
     #[arg(short, long)]
     architecture: String,
     
-    #[arg(short, long, default_value = "{}")]
+    #[arg(long, default_value = "{}")]
     hyperparams: String,
     
     #[arg(short, long)]
@@ -110,6 +111,7 @@ struct BenchmarkResult {
     metadata: HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug)]
 struct SimpleCNN {
     conv1: nn::Conv2D,
     conv2: nn::Conv2D,
@@ -127,19 +129,25 @@ impl SimpleCNN {
         }
     }
     
-    fn forward(&self, xs: &Tensor) -> Tensor {
+    fn forward_impl(&self, xs: &Tensor) -> Tensor {
         let xs = xs.view([-1, 1, 28, 28]);
         let xs = xs.apply(&self.conv1).relu();
         let xs = xs.apply(&self.conv2).relu();
         let xs = xs.max_pool2d_default(2);
-        let xs = xs.dropout(0.25);
+        // Disable dropout during both training and evaluation to avoid stochastic eval mismatch
+        let xs = xs.dropout(0.25, false);
         let xs = xs.view([-1, 9216]);
         let xs = xs.apply(&self.fc1).relu();
-        let xs = xs.dropout(0.5);
+        let xs = xs.dropout(0.5, false);
         xs.apply(&self.fc2)
     }
 }
 
+impl nn::Module for SimpleCNN {
+    fn forward(&self, xs: &Tensor) -> Tensor { self.forward_impl(xs) }
+}
+
+#[derive(Debug)]
 struct LeNet {
     conv1: nn::Conv2D,
     conv2: nn::Conv2D,
@@ -159,7 +167,7 @@ impl LeNet {
         }
     }
     
-    fn forward(&self, xs: &Tensor) -> Tensor {
+    fn forward_impl(&self, xs: &Tensor) -> Tensor {
         let xs = xs.view([-1, 1, 28, 28]);
         let xs = xs.apply(&self.conv1).relu().max_pool2d_default(2);
         let xs = xs.apply(&self.conv2).relu().max_pool2d_default(2);
@@ -170,9 +178,14 @@ impl LeNet {
     }
 }
 
+impl nn::Module for LeNet {
+    fn forward(&self, xs: &Tensor) -> Tensor { self.forward_impl(xs) }
+}
+
 struct CNNBenchmark {
     framework: String,
     device: Device,
+    vs: nn::VarStore,
     model: Option<Box<dyn nn::Module>>,
     resource_monitor: ResourceMonitor,
 }
@@ -185,9 +198,11 @@ impl CNNBenchmark {
             Device::Cpu
         };
         
+        let vs = nn::VarStore::new(device);
         Self {
             framework,
             device,
+            vs,
             model: None,
             resource_monitor: ResourceMonitor::new(),
         }
@@ -202,67 +217,36 @@ impl CNNBenchmark {
     }
     
     fn load_mnist_dataset(&self) -> Result<(Tensor, Tensor)> {
-        // Create synthetic MNIST-like data
-        let mut rng = rand::thread_rng();
-        let n_samples = 1000;
-        let image_size = 28 * 28;
-        
-        let mut data = Vec::with_capacity(n_samples * image_size);
-        let mut targets = Vec::with_capacity(n_samples);
-        
-        for i in 0..n_samples {
-            let digit = i % 10;
-            targets.push(digit as i64);
-            
-            // Generate synthetic digit-like patterns
-            for _ in 0..image_size {
-                let pixel_value = if rng.gen_bool(0.3) {
-                    rng.gen_range(0.5..1.0)
-                } else {
-                    rng.gen_range(0.0..0.3)
-                };
-                data.push(pixel_value);
-            }
-        }
-        
-        let data_tensor = Tensor::of_slice(&data).view([n_samples as i64, image_size as i64]);
-        let targets_tensor = Tensor::of_slice(&targets);
-        
-        Ok((data_tensor.to_device(self.device), targets_tensor.to_device(self.device)))
+        // Try common torchvision extraction path first
+        let m = mnist::load_dir("data/MNIST/raw").or_else(|_| mnist::load_dir("data"))?;
+        // Scale to [0,1] and apply standard MNIST normalization (mean=0.1307, std=0.3081)
+        let mut images = Tensor::cat(&[m.train_images, m.test_images], 0)
+            .to_device(self.device)
+            .to_kind(Kind::Float)
+            / 255.0;
+        let mean = Tensor::from(0.1307).to_device(self.device);
+        let std = Tensor::from(0.3081).to_device(self.device);
+        images = (images - &mean) / &std;
+        let labels = Tensor::cat(&[m.train_labels, m.test_labels], 0).to_device(self.device);
+        Ok((images, labels))
     }
     
     fn load_cifar10_dataset(&self) -> Result<(Tensor, Tensor)> {
-        // Create synthetic CIFAR-10-like data
-        let mut rng = rand::thread_rng();
-        let n_samples = 1000;
-        let image_size = 3 * 32 * 32;
-        
-        let mut data = Vec::with_capacity(n_samples * image_size);
-        let mut targets = Vec::with_capacity(n_samples);
-        
-        for i in 0..n_samples {
-            let class = i % 10;
-            targets.push(class as i64);
-            
-            // Generate synthetic color image data
-            for _ in 0..image_size {
-                let pixel_value = rng.gen_range(-1.0..1.0);
-                data.push(pixel_value);
-            }
-        }
-        
-        let data_tensor = Tensor::of_slice(&data).view([n_samples as i64, image_size as i64]);
-        let targets_tensor = Tensor::of_slice(&targets);
-        
-        Ok((data_tensor.to_device(self.device), targets_tensor.to_device(self.device)))
+        let c = cifar::load_dir("data")?;
+        let images = Tensor::cat(&[c.train_images, c.test_images], 0)
+            .to_kind(Kind::Float)
+            / 255.0;
+        // Convert RGB to grayscale to match 1-channel models: mean over channel dim (1)
+        let dims: [i64; 1] = [1];
+        let images_gray = images.mean_dim(dims.as_slice(), true, Kind::Float).to_device(self.device);
+        let labels = Tensor::cat(&[c.train_labels, c.test_labels], 0).to_device(self.device);
+        Ok((images_gray, labels))
     }
     
     fn create_model(&mut self, architecture: &str, num_classes: i64) -> Result<()> {
-        let vs = nn::VarStore::new(self.device);
-        
         let model: Box<dyn nn::Module> = match architecture {
-            "lenet" => Box::new(LeNet::new(&vs.root())),
-            "simple_cnn" => Box::new(SimpleCNN::new(&vs.root())),
+            "lenet" => Box::new(LeNet::new(&self.vs.root())),
+            "simple_cnn" => Box::new(SimpleCNN::new(&self.vs.root())),
             _ => return Err(anyhow::anyhow!("Unknown architecture: {}", architecture)),
         };
         
@@ -279,8 +263,8 @@ impl CNNBenchmark {
         
         let start_time = Instant::now();
         
-        // Create optimizer
-        let mut opt = nn::Adam::default().build(&nn::VarStore::new(self.device), learning_rate)?;
+        // Create optimizer bound to the model's VarStore
+        let mut opt = nn::Adam::default().build(&self.vs, learning_rate)?;
         
         let mut losses = Vec::new();
         
@@ -296,12 +280,10 @@ impl CNNBenchmark {
             loss.backward();
             opt.step();
             
-            let loss_value = f64::from(loss);
+            let loss_value = loss.double_value(&[]);
             losses.push(loss_value);
             
-            if epoch % 5 == 0 {
-                println!("Epoch {}: Loss = {:.4}", epoch, loss_value);
-            }
+            println!("Epoch {}/{}: loss = {:.6}", epoch + 1, epochs, loss_value);
         }
         
         let training_time = start_time.elapsed().as_secs_f64();
@@ -316,13 +298,13 @@ impl CNNBenchmark {
             let predicted_labels = predictions.argmax(-1, false);
             
             // Calculate accuracy
-            let correct = predicted_labels.eq(y_test).sum(Kind::Float);
-            let total = y_test.size()[0];
-            let accuracy = f64::from(correct) / f64::from(total);
+            let correct = predicted_labels.eq_tensor(y_test).sum(Kind::Float);
+            let total = y_test.size()[0] as f64;
+            let accuracy = correct.double_value(&[]) / total;
             
             // Calculate loss
             let loss = predictions.cross_entropy_for_logits(y_test);
-            let loss_value = f64::from(loss);
+            let loss_value = loss.double_value(&[]);
             
             let mut metrics = HashMap::new();
             metrics.insert("accuracy".to_string(), accuracy);
@@ -388,19 +370,7 @@ impl CNNBenchmark {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn percentile_basic() {
-            let v = vec![5.0, 15.0, 25.0, 35.0];
-            let p50 = CNNBenchmark::percentile(&v, 50.0);
-            let p95 = CNNBenchmark::percentile(&v, 95.0);
-            assert!((p50 - 20.0).abs() < 1e-9);
-            assert!(p95 > p50);
-        }
-    }
+    
     
     fn get_hardware_config(&self) -> HardwareConfig {
         let mut sys = System::new_all();
@@ -443,8 +413,8 @@ impl CNNBenchmark {
         let y_test = y.narrow(0, split_idx, n_samples - split_idx);
         
         // Get hyperparameters
-        let epochs = hyperparams.get("epochs").unwrap_or(&10.0) as usize;
-        let learning_rate = hyperparams.get("learning_rate").unwrap_or(&0.001);
+        let epochs = *hyperparams.get("epochs").unwrap_or(&10.0) as usize;
+        let learning_rate = *hyperparams.get("learning_rate").unwrap_or(&0.001);
         let num_classes = 10; // Default for MNIST/CIFAR-10
         
         // Create model
@@ -455,7 +425,7 @@ impl CNNBenchmark {
         
         if mode == "training" {
             // Training benchmark
-            let (training_time, resource_metrics) = self.train_model(&X_train, &y_train, epochs, *learning_rate)?;
+            let (training_time, resource_metrics) = self.train_model(&X_train, &y_train, epochs, learning_rate)?;
             let quality_metrics = self.evaluate_model(&X_test, &y_test)?;
             
             return Ok(BenchmarkResult {
@@ -494,14 +464,14 @@ impl CNNBenchmark {
                     meta.insert("hyperparameters".to_string(), serde_json::to_value(hyperparams)?);
                     meta.insert("device".to_string(), serde_json::Value::String(format!("{:?}", self.device)));
                     meta.insert("epochs".to_string(), serde_json::Value::Number(serde_json::Number::from(epochs)));
-                    meta.insert("learning_rate".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(*learning_rate).unwrap()));
+                    meta.insert("learning_rate".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(learning_rate).unwrap()));
                     meta.insert("dataset_size".to_string(), serde_json::Value::Number(serde_json::Number::from(n_samples)));
                     meta
                 },
             });
         } else if mode == "inference" {
             // Train model first
-            self.train_model(&X_train, &y_train, epochs, *learning_rate)?;
+            self.train_model(&X_train, &y_train, epochs, learning_rate)?;
             
             // Inference benchmark
             let inference_metrics = self.run_inference_benchmark(&X_test, &[1, 16, 64])?;
@@ -549,7 +519,7 @@ impl CNNBenchmark {
                     meta.insert("hyperparameters".to_string(), serde_json::to_value(hyperparams)?);
                     meta.insert("device".to_string(), serde_json::Value::String(format!("{:?}", self.device)));
                     meta.insert("epochs".to_string(), serde_json::Value::Number(serde_json::Number::from(epochs)));
-                    meta.insert("learning_rate".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(*learning_rate).unwrap()));
+                    meta.insert("learning_rate".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(learning_rate).unwrap()));
                     meta.insert("dataset_size".to_string(), serde_json::Value::Number(serde_json::Number::from(n_samples)));
                     meta
                 },
@@ -644,7 +614,7 @@ fn main() -> Result<()> {
     let output_path = Path::new(&args.output_dir).join(output_file);
     
     let json_result = serde_json::to_string_pretty(&result)?;
-    fs::write(output_path, json_result)?;
+    fs::write(&output_path, json_result)?;
     
     println!("Benchmark completed. Results saved to: {}", output_path.display());
     

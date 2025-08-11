@@ -11,22 +11,25 @@ workflow PHASE4_BENCHMARK {
         // Execute classical ML benchmarks
         EXECUTE_CLASSICAL_ML_BENCHMARKS(validated_implementations, environment_config)
         
-        // Execute deep learning benchmarks
-        EXECUTE_DEEP_LEARNING_BENCHMARKS(validated_implementations, environment_config)
-        
-        // Execute reinforcement learning benchmarks
-        EXECUTE_RL_BENCHMARKS(validated_implementations, environment_config)
-        
-        // Execute LLM benchmarks
-        EXECUTE_LLM_BENCHMARKS(validated_implementations, environment_config)
-        
-        // Collect all benchmark results
-        COLLECT_BENCHMARK_RESULTS(
-            EXECUTE_CLASSICAL_ML_BENCHMARKS.out.results,
-            EXECUTE_DEEP_LEARNING_BENCHMARKS.out.results,
-            EXECUTE_RL_BENCHMARKS.out.results,
-            EXECUTE_LLM_BENCHMARKS.out.results
-        )
+        if (params.only_classical_ml) {
+            COLLECT_BENCHMARK_RESULTS(
+                EXECUTE_CLASSICAL_ML_BENCHMARKS.out.results,
+                null,
+                null,
+                null
+            )
+        } else {
+            // Execute deep learning, RL, LLM benchmarks
+            EXECUTE_DEEP_LEARNING_BENCHMARKS(validated_implementations, environment_config)
+            EXECUTE_RL_BENCHMARKS(validated_implementations, environment_config)
+            EXECUTE_LLM_BENCHMARKS(validated_implementations, environment_config)
+            COLLECT_BENCHMARK_RESULTS(
+                EXECUTE_CLASSICAL_ML_BENCHMARKS.out.results,
+                EXECUTE_DEEP_LEARNING_BENCHMARKS.out.results,
+                EXECUTE_RL_BENCHMARKS.out.results,
+                EXECUTE_LLM_BENCHMARKS.out.results
+            )
+        }
     
     emit:
         benchmark_results = COLLECT_BENCHMARK_RESULTS.out.all_results

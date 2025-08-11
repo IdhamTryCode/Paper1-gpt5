@@ -89,6 +89,9 @@ class QualityMetrics:
     perplexity: Optional[float] = None
     episode_reward: Optional[float] = None
     convergence_steps: Optional[int] = None
+    # Clustering-specific (optional)
+    silhouette_score: Optional[float] = None
+    inertia: Optional[float] = None
 
 
 @dataclass
@@ -159,6 +162,8 @@ class BenchmarkResult:
                 "perplexity": self.quality_metrics.perplexity,
                 "episode_reward": self.quality_metrics.episode_reward,
                 "convergence_steps": self.quality_metrics.convergence_steps,
+                "silhouette_score": self.quality_metrics.silhouette_score,
+                "inertia": self.quality_metrics.inertia,
             },
             "metadata": self.metadata,
         }
